@@ -3,6 +3,8 @@ mod capture;
 mod libei;
 mod portal;
 
+use std::os::unix::fs::PermissionsExt;
+
 use image::RgbaImage;
 
 use crate::desktop::{
@@ -93,20 +95,22 @@ impl WaylandBackend {
 		}
 	}
 
+	fn has_tool(name: &str) -> bool {
+		// In-process PATH lookup: no `which` subprocess, no dependency on it.
+		std::env::var_os("PATH").is_some_and(|paths| {
+			std::env::split_paths(&paths).any(|dir| {
+				std::fs::metadata(dir.join(name))
+					.is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+			})
+		})
+	}
+
 	fn has_grim() -> bool {
-		std::process::Command::new("which")
-			.arg("grim")
-			.output()
-			.map(|o| o.status.success())
-			.unwrap_or(false)
+		Self::has_tool("grim")
 	}
 
 	fn has_wtype() -> bool {
-		std::process::Command::new("which")
-			.arg("wtype")
-			.output()
-			.map(|o| o.status.success())
-			.unwrap_or(false)
+		Self::has_tool("wtype")
 	}
 
 	fn capture_grim() -> CoreResult<RgbaImage> {
@@ -444,7 +448,11 @@ impl Backend for WaylandBackend {
 							KeyName::Char(c) => {
 								cmd.arg(c.to_string());
 							},
-							_ => {},
+							key => {
+								return Err(DesktopError::invalid_key(format!(
+									"wtype fallback has no mapping for key `{key:?}`"
+								)));
+							},
 						}
 					}
 					let status = cmd
