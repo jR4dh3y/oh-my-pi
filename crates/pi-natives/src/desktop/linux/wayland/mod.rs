@@ -17,10 +17,6 @@ use crate::desktop::{
 };
 
 pub struct WaylandBackend {
-	#[cfg_attr(
-		not(feature = "wayland-pipewire"),
-		expect(dead_code, reason = "only read by the pipewire capture path")
-	)]
 	display:     DisplaySelector,
 	ax:          Option<AtSpiAx>,
 	ax_error:    Option<DesktopError>,
@@ -70,7 +66,6 @@ impl WaylandBackend {
 		}))
 	}
 
-	#[cfg(feature = "wayland-pipewire")]
 	fn synthetic_display(image: &RgbaImage) -> DesktopDisplay {
 		DesktopDisplay {
 			id:           "wayland-portal-0".to_string(),
@@ -88,39 +83,131 @@ impl WaylandBackend {
 		}
 	}
 
-	#[cfg(feature = "wayland-pipewire")]
 	fn selected_display_allowed(&self) -> CoreResult<()> {
 		match &self.display {
 			DisplaySelector::All => Ok(()),
-			DisplaySelector::Id(id) if id == "wayland-portal-0" => Ok(()),
+			DisplaySelector::Id(id) if id == "wayland-portal-0" || id == "wayland-display-0" => Ok(()),
 			DisplaySelector::Id(id) => Err(DesktopError::invalid_target(format!(
-				"Wayland portal display '{id}' is unavailable; use 'all' or 'wayland-portal-0'"
+				"Wayland display '{id}' is unavailable; use 'all'"
 			))),
 		}
+	}
+
+	fn has_grim() -> bool {
+		std::process::Command::new("which")
+			.arg("grim")
+			.output()
+			.map(|o| o.status.success())
+			.unwrap_or(false)
+	}
+
+	fn has_wtype() -> bool {
+		std::process::Command::new("which")
+			.arg("wtype")
+			.output()
+			.map(|o| o.status.success())
+			.unwrap_or(false)
+	}
+
+	fn capture_grim() -> CoreResult<RgbaImage> {
+		let output = std::process::Command::new("grim")
+			.args(["-l", "0", "-t", "png", "-"])
+			.output()
+			.map_err(|err| DesktopError::capture_failed(format!("failed to run grim: {err}")))?;
+		if !output.status.success() {
+			let stderr = String::from_utf8_lossy(&output.stderr);
+			return Err(DesktopError::capture_failed(format!("grim capture failed: {stderr}")));
+		}
+		let img = image::load_from_memory(&output.stdout).map_err(|err| {
+			DesktopError::capture_failed(format!("failed to decode grim PNG: {err}"))
+		})?;
+		Ok(img.to_rgba8())
+	}
+
+	fn niri_windows() -> Option<Vec<DesktopWindow>> {
+		let output = std::process::Command::new("niri")
+			.args(["msg", "--json", "windows"])
+			.output()
+			.ok()?;
+		if !output.status.success() {
+			return None;
+		}
+		let val: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+		let arr = val.as_array()?;
+		let mut wins = Vec::new();
+		for item in arr {
+			let Some(id) = item.get("id").map(ToString::to_string) else {
+				continue;
+			};
+			let title = item
+				.get("title")
+				.and_then(|v| v.as_str())
+				.unwrap_or("")
+				.to_string();
+			let app = item
+				.get("app_id")
+				.and_then(|v| v.as_str())
+				.unwrap_or("")
+				.to_string();
+			let pid = item.get("pid").and_then(|v| v.as_u64()).map(|p| p as u32);
+			let focused = item
+				.get("is_focused")
+				.and_then(|v| v.as_bool())
+				.unwrap_or(false);
+			let (width, height) = if let Some(ws) = item
+				.get("layout")
+				.and_then(|l| l.get("window_size"))
+				.and_then(|v| v.as_array())
+			{
+				(
+					ws.first().and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+					ws.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+				)
+			} else {
+				(0, 0)
+			};
+			wins.push(DesktopWindow { id, title, app, pid, x: 0, y: 0, width, height, focused });
+		}
+		Some(wins)
+	}
+
+	#[cfg(feature = "wayland-pipewire")]
+	fn capture_pipewire_image(&self) -> CoreResult<RgbaImage> {
+		capture::capture()
+	}
+
+	#[cfg(not(feature = "wayland-pipewire"))]
+	fn capture_pipewire_image(&self) -> CoreResult<RgbaImage> {
+		Err(DesktopError::capture_failed(
+			"Wayland capture requires the wayland-pipewire feature or the grim tool",
+		))
 	}
 }
 
 impl Backend for WaylandBackend {
 	fn capabilities(&mut self) -> DesktopCapabilities {
+		let has_grim = Self::has_grim();
+		let can_capture = cfg!(feature = "wayland-pipewire") || has_grim;
 		let input_permission = if self.input.is_some() {
 			"granted"
 		} else if self.input_error.is_some() {
-			"unavailable"
+			if Self::has_wtype() {
+				"granted"
+			} else {
+				"unavailable"
+			}
 		} else {
 			"prompt-or-granted"
 		};
 		DesktopCapabilities {
 			backend: "wayland".to_string(),
 			display_server: Some("wayland".to_string()),
-			// The PipeWire screencast path is compiled in only under the
-			// wayland-pipewire feature; without it capture() hard-errors, so the
-			// capability report must not advertise a capture the binary cannot do.
-			capture: cfg!(feature = "wayland-pipewire"),
-			input: self.input_error.is_none(),
+			capture: can_capture,
+			input: self.input_error.is_none() || Self::has_wtype(),
 			ax: self.ax.is_some(),
 			background_window_input: false,
 			delivery_modes: vec!["background".to_string()],
-			capture_permission: if cfg!(feature = "wayland-pipewire") {
+			capture_permission: if can_capture {
 				"prompt-or-granted".to_string()
 			} else {
 				"unavailable".to_string()
@@ -140,16 +227,31 @@ impl Backend for WaylandBackend {
 	}
 
 	fn windows(&mut self) -> CoreResult<Vec<DesktopWindow>> {
-		self
+		let mut wins = self
 			.ax
 			.as_mut()
-			.ok_or_else(|| {
+			.and_then(|ax| ax.windows().ok())
+			.unwrap_or_default();
+		if let Some(niri_wins) = Self::niri_windows() {
+			for nw in niri_wins {
+				let duplicate = wins.iter().any(|w| w.pid == nw.pid && w.title == nw.title);
+				if !duplicate {
+					wins.push(nw);
+				}
+			}
+		}
+		if wins.is_empty() {
+			if let Some(ax) = self.ax.as_mut() {
+				return ax.windows();
+			}
+			return Err(
 				self
 					.ax_error
 					.clone()
-					.unwrap_or_else(DesktopError::ax_unsupported)
-			})?
-			.windows()
+					.unwrap_or_else(DesktopError::ax_unsupported),
+			);
+		}
+		Ok(wins)
 	}
 
 	fn capture(
@@ -157,50 +259,52 @@ impl Backend for WaylandBackend {
 		target: &Target,
 		_caps: &CaptureCaps,
 	) -> CoreResult<(RgbaImage, FrameGeometry)> {
-		#[cfg(not(feature = "wayland-pipewire"))]
-		{
-			let _ = target;
-			Err(DesktopError::capture_failed("Wayland capture requires the wayland-pipewire feature"))
-		}
-		#[cfg(feature = "wayland-pipewire")]
-		{
-			self.selected_display_allowed()?;
-			let image = capture::capture()?;
-			let display = Self::synthetic_display(&image);
-			self.displays = vec![display.clone()];
-			match target {
-				Target::Desktop => {
-					let geometry = FrameGeometry::for_displays(&self.displays);
-					Ok((image, geometry))
-				},
-				Target::Window(id) => {
-					let window = self
-						.windows()?
-						.into_iter()
-						.find(|window| &window.id == id)
-						.ok_or_else(|| {
-							DesktopError::window_not_found(format!("Wayland window {id} not found"))
-						})?;
-					if window.x < 0 || window.y < 0 {
-						return Err(DesktopError::capture_failed(
-							"Wayland portal monitor stream cannot crop a window outside the selected \
-							 monitor",
-						));
-					}
-					let x = window.x as u32;
-					let y = window.y as u32;
-					let width = window.width.min(image.width().saturating_sub(x));
-					let height = window.height.min(image.height().saturating_sub(y));
-					if width == 0 || height == 0 {
-						return Err(DesktopError::capture_failed(format!(
-							"Wayland window {id} is outside the selected portal monitor"
-						)));
-					}
-					let cropped = image::imageops::crop_imm(&image, x, y, width, height).to_image();
-					let geometry = FrameGeometry::for_window(&window, cropped.width(), cropped.height());
-					Ok((cropped, geometry))
-				},
+		self.selected_display_allowed()?;
+
+		let image = if Self::has_grim() {
+			// grim serves the compositor-native screencopy protocol directly: no
+			// portal dialog, no PipeWire round-trip. Fall back to the portal path
+			// only when grim itself fails (e.g. compositors without wlr-screencopy).
+			match Self::capture_grim() {
+				Ok(image) => image,
+				Err(grim_err) => self.capture_pipewire_image().map_err(|_| grim_err)?,
 			}
+		} else {
+			self.capture_pipewire_image()?
+		};
+		let display = Self::synthetic_display(&image);
+		self.displays = vec![display.clone()];
+		match target {
+			Target::Desktop => {
+				let geometry = FrameGeometry::for_displays(&self.displays);
+				Ok((image, geometry))
+			},
+			Target::Window(id) => {
+				let window = self
+					.windows()?
+					.into_iter()
+					.find(|window| &window.id == id)
+					.ok_or_else(|| {
+						DesktopError::window_not_found(format!("Wayland window {id} not found"))
+					})?;
+				if window.x < 0 || window.y < 0 {
+					return Err(DesktopError::capture_failed(
+						"Wayland portal monitor stream cannot crop a window outside the selected monitor",
+					));
+				}
+				let x = window.x as u32;
+				let y = window.y as u32;
+				let width = window.width.min(image.width().saturating_sub(x));
+				let height = window.height.min(image.height().saturating_sub(y));
+				if width == 0 || height == 0 {
+					return Err(DesktopError::capture_failed(format!(
+						"Wayland window {id} is outside the selected portal monitor"
+					)));
+				}
+				let cropped = image::imageops::crop_imm(&image, x, y, width, height).to_image();
+				let geometry = FrameGeometry::for_window(&window, cropped.width(), cropped.height());
+				Ok((cropped, geometry))
+			},
 		}
 	}
 
@@ -215,9 +319,22 @@ impl Backend for WaylandBackend {
 	}
 
 	fn type_text(&mut self, target: &Target, text: &str, _mode: DeliveryMode) -> CoreResult<()> {
-		self
-			.prepare_input(target, "keyboard input")?
-			.type_text(text)
+		Self::window_input_error(target, "keyboard input")?;
+		match self.prepare_input(target, "keyboard input") {
+			Ok(input) => input.type_text(text),
+			Err(err) => {
+				if matches!(target, Target::Desktop) && Self::has_wtype() {
+					let status = std::process::Command::new("wtype")
+						.args(["--", text])
+						.status()
+						.map_err(|e| DesktopError::permission_denied(format!("wtype failed: {e}")))?;
+					if status.success() {
+						return Ok(());
+					}
+				}
+				Err(err)
+			},
+		}
 	}
 
 	fn key_chord(
@@ -226,12 +343,133 @@ impl Backend for WaylandBackend {
 		keys: &[KeyName],
 		_mode: DeliveryMode,
 	) -> CoreResult<()> {
-		self
-			.prepare_input(target, "keyboard input")?
-			.key_chord(keys)
+		Self::window_input_error(target, "keyboard input")?;
+		match self.prepare_input(target, "keyboard input") {
+			Ok(input) => input.key_chord(keys),
+			Err(err) => {
+				if matches!(target, Target::Desktop) && Self::has_wtype() {
+					let mut cmd = std::process::Command::new("wtype");
+					for key in keys {
+						match key {
+							KeyName::Ctrl => {
+								cmd.arg("-M").arg("ctrl");
+							},
+							KeyName::Alt => {
+								cmd.arg("-M").arg("alt");
+							},
+							KeyName::Shift => {
+								cmd.arg("-M").arg("shift");
+							},
+							KeyName::Meta => {
+								cmd.arg("-M").arg("logo");
+							},
+							KeyName::Enter => {
+								cmd.arg("-k").arg("Return");
+							},
+							KeyName::Escape => {
+								cmd.arg("-k").arg("Escape");
+							},
+							KeyName::Tab => {
+								cmd.arg("-k").arg("Tab");
+							},
+							KeyName::Space => {
+								cmd.arg("-k").arg("space");
+							},
+							KeyName::Backspace => {
+								cmd.arg("-k").arg("BackSpace");
+							},
+							KeyName::Delete => {
+								cmd.arg("-k").arg("Delete");
+							},
+							KeyName::Home => {
+								cmd.arg("-k").arg("Home");
+							},
+							KeyName::End => {
+								cmd.arg("-k").arg("End");
+							},
+							KeyName::PageUp => {
+								cmd.arg("-k").arg("Page_Up");
+							},
+							KeyName::PageDown => {
+								cmd.arg("-k").arg("Page_Down");
+							},
+							KeyName::Up => {
+								cmd.arg("-k").arg("Up");
+							},
+							KeyName::Down => {
+								cmd.arg("-k").arg("Down");
+							},
+							KeyName::Left => {
+								cmd.arg("-k").arg("Left");
+							},
+							KeyName::Right => {
+								cmd.arg("-k").arg("Right");
+							},
+							KeyName::F1 => {
+								cmd.arg("-k").arg("F1");
+							},
+							KeyName::F2 => {
+								cmd.arg("-k").arg("F2");
+							},
+							KeyName::F3 => {
+								cmd.arg("-k").arg("F3");
+							},
+							KeyName::F4 => {
+								cmd.arg("-k").arg("F4");
+							},
+							KeyName::F5 => {
+								cmd.arg("-k").arg("F5");
+							},
+							KeyName::F6 => {
+								cmd.arg("-k").arg("F6");
+							},
+							KeyName::F7 => {
+								cmd.arg("-k").arg("F7");
+							},
+							KeyName::F8 => {
+								cmd.arg("-k").arg("F8");
+							},
+							KeyName::F9 => {
+								cmd.arg("-k").arg("F9");
+							},
+							KeyName::F10 => {
+								cmd.arg("-k").arg("F10");
+							},
+							KeyName::F11 => {
+								cmd.arg("-k").arg("F11");
+							},
+							KeyName::F12 => {
+								cmd.arg("-k").arg("F12");
+							},
+							KeyName::Char(c) => {
+								cmd.arg(c.to_string());
+							},
+							_ => {},
+						}
+					}
+					let status = cmd
+						.status()
+						.map_err(|e| DesktopError::permission_denied(format!("wtype failed: {e}")))?;
+					if status.success() {
+						return Ok(());
+					}
+				}
+				Err(err)
+			},
+		}
 	}
 
 	fn raise_window(&mut self, id: &str) -> CoreResult<()> {
+		if let Ok(num_id) = id.parse::<u64>() {
+			if let Ok(status) = std::process::Command::new("niri")
+				.args(["msg", "action", "focus-window", "--id", &num_id.to_string()])
+				.status()
+			{
+				if status.success() {
+					return Ok(());
+				}
+			}
+		}
 		Err(DesktopError::background_unavailable(format!(
 			"window {id} wayland-compositor-focus-only: Wayland cannot programmatically activate a \
 			 non-focused window; only the currently focused surface is reachable"
@@ -372,13 +610,17 @@ mod tests {
 			displays:    Vec::new(),
 		};
 		let caps = backend.capabilities();
-		// Shipped builds compile without wayland-pipewire, so the capture path is
-		// absent; capabilities() must not advertise capture the binary cannot do.
-		assert!(!caps.capture, "capture must be false when the pipewire feature is off");
-		assert_eq!(caps.capture_permission, "unavailable");
-		let err = backend
-			.capture(&Target::Desktop, &CaptureCaps::default())
-			.expect_err("capture must fail without the pipewire feature");
-		assert_eq!(err.code.as_str(), "CaptureFailed");
+		// Without the pipewire feature, capture is available only through the
+		// grim fallback, so capabilities() must agree with capture() in both cases.
+		assert_eq!(caps.capture, WaylandBackend::has_grim());
+		if WaylandBackend::has_grim() {
+			assert_eq!(caps.capture_permission, "prompt-or-granted");
+		} else {
+			assert_eq!(caps.capture_permission, "unavailable");
+			let err = backend
+				.capture(&Target::Desktop, &CaptureCaps::default())
+				.expect_err("capture must fail without the pipewire feature or grim");
+			assert_eq!(err.code.as_str(), "CaptureFailed");
+		}
 	}
 }

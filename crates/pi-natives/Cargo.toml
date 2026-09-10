@@ -16,8 +16,9 @@ workspace = true
 [features]
 # Off by default: the pipewire crate hard-links system libpipewire-0.3 via
 # pkg-config, which no CI/cross triple (musl, arm64) can satisfy, and the
-# Bazel-shipped addons build with crate_features = [] anyway. Linux devs who
-# want Wayland screencast opt in with `--features wayland-pipewire`.
+# Bazel-shipped addons build with crate_features = [] anyway. Wayland capture
+# still works without it through the grim fallback; Linux devs who want the
+# portal/PipeWire path opt in with `--features wayland-pipewire`.
 default = []
 wayland-pipewire = ["dep:pipewire"]
 

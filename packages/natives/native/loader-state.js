@@ -180,7 +180,11 @@ export function resolveLoaderCandidates({
 	} else {
 		releaseCandidates = [...leafCandidates, ...baseReleaseCandidates];
 	}
-	return [...new Set(releaseCandidates)];
+	const envPath = process.env.PI_NATIVES_PATH;
+	const envCandidates = envPath
+		? [envPath, ...addonFilenames.map(filename => path.join(envPath, filename))]
+		: [];
+	return [...new Set([...envCandidates, ...releaseCandidates])];
 }
 
 // =========================================================================
