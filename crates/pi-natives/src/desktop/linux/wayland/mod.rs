@@ -267,8 +267,11 @@ impl Backend for WaylandBackend {
 
 		let image = if Self::has_grim() {
 			// grim serves the compositor-native screencopy protocol directly: no
-			// portal dialog, no PipeWire round-trip. Fall back to the portal path
-			// only when grim itself fails (e.g. compositors without wlr-screencopy).
+			// portal dialog, no PipeWire round-trip. This ordering is load-bearing:
+			// Niri >=26 offers DMA-BUF-only portal formats, which a memptr client
+			// cannot satisfy ("no more input formats"), so the portal path yields
+			// no frames there even when approved. Fall back to it only when grim
+			// itself fails (e.g. compositors without wlr-screencopy).
 			match Self::capture_grim() {
 				Ok(image) => image,
 				Err(grim_err) => self.capture_pipewire_image().map_err(|_| grim_err)?,
